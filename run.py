@@ -6,6 +6,8 @@ import re
 import os
 import shutil
 import logging
+import pathlib
+
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -37,12 +39,12 @@ def setup_logger(folder_path):
 
 def driver_config(args):
     options = webdriver.ChromeOptions()
+    
+    # maximize window
+    options.add_argument('--start-maximized')
+    options.add_argument("--force-device-scale-factor=1")
+    options.add_argument("disable-blink-features=AutomationControlled")
 
-    if args.save_accessibility_tree:
-        args.force_device_scale = True
-
-    if args.force_device_scale:
-        options.add_argument("--force-device-scale-factor=1")
     if args.headless:
         options.add_argument("--headless")
         options.add_argument(
@@ -115,8 +117,7 @@ def call_gemini_api(args, client, messages):
             if not args.text_only:
                 logging.info('Calling Gemini API...')
                 #model = genai.GenerativeModel('gemini-pro-vision')
-                gemini_response = client.send_message(messages)
-                        
+                gemini_response = client.send_message(messages)           
             else:
                 logging.info('Calling Gemini API...')
                 gemini_response = client.send_message(messages)
@@ -230,9 +231,9 @@ def exec_action_scroll(info, web_eles, driver_task, args, obs_info):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--test_file', type=str, default='data/test.json')
-    parser.add_argument('--max_iter', type=int, default=5)
+    parser.add_argument('--max_iter', type=int, default=15)
     parser.add_argument("--api_key", default="key", type=str, help="YOUR_OPENAI_API_KEY")
-    parser.add_argument("--api_model", default="gpt-4-vision-preview", type=str, help="api model name")
+    parser.add_argument("--api_model", default="gemini-1.5-flash", type=str, help="api model name")
     parser.add_argument("--output_dir", type=str, default='results')
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--max_attached_imgs", type=int, default=1)
@@ -250,28 +251,40 @@ def main():
     args = parser.parse_args()
 
     # GenAI client
-    print(args.api_key)
     genai.configure(api_key = args.api_key)
-    model =  genai.GenerativeModel('gemini-1.5-pro')
+   
+    model0 =  genai.GenerativeModel(model_name=args.api_model)
+    video_file = genai.upload_file(path="cast_annotate.mp4")
+    print(f"Completed upload: {video_file.uri}")
+    print(video_file.mime_type)
+
+    import time
+    time.sleep(10)
+
+    prompt = "Give a one sentence summary of what is happening in the video And then describe the steps in the video in a very detailed manner. Make sure you are extremely specific, so that another agent can follow your instructions to recreate the steps. Make sure to mention every single component you are interacting with"
+    response = model0.generate_content([video_file, prompt],
+                                  request_options={"timeout": 600})
+    
+    video_text = "I am also attaching video along with a following text explaining what is happening in it. (Please use the vidoe and text as reference for performing future tasks.)"
+    video_description = video_text + response.text
+    print(video_description)
+    
+    model =  genai.GenerativeModel(model_name=args.api_model, system_instruction=SYSTEM_PROMPT)
     context = [
     {
-        "role" : "user",
+        "role": "user",
         "parts" : [
             {
-                "text" :  SYSTEM_PROMPT            
-            }
-        ],
-    },
-    {
-        "role" : "model",
-        "parts" : [
+                "text": video_description
+            },
             {
-                "text" : "Understood"
+                "file_data": { "mime_type": video_file.mime_type, "file_uri": video_file.uri   }
             }
         ]
     }
     ]
-    client = model.start_chat(history=context)
+
+    client = model.start_chat(history=[])
 
     options = driver_config(args)
 
@@ -329,18 +342,20 @@ def main():
         init_msg = f"""Now given a task: {task['ques']}  Please interact with https://www.example.com and get the answer. \n"""
         init_msg = init_msg.replace('https://www.example.com', task['web'])
         init_msg = init_msg + obs_prompt
-        print(init_msg)
+
+        print("***User***:"+ task['ques'])
+        print("\n")
         it = 0
         accumulate_prompt_token = 0
         accumulate_completion_token = 0
-
+        debug_messages = []
         while it < args.max_iter:
             logging.info(f'Iter: {it}')
             it += 1
             if not fail_obs:
                 try:
                     if not args.text_only:
-                        print("creating rectangles")
+                        #print("creating rectangles")
                         rects, web_eles, web_eles_text = get_web_element_rect(driver_task, fix_color=args.fix_box_color)
                     else:
                         accessibility_tree_path = os.path.join(task_dir, 'accessibility_tree{}'.format(it))
@@ -363,7 +378,6 @@ def main():
                     get_webarena_accessibility_tree(driver_task, accessibility_tree_path)
 
                 # encode image
-                import pathlib
                 b64_img = pathlib.Path(img_path).read_bytes() #encode_image(img_path)
 
                 # format msg
@@ -373,8 +387,7 @@ def main():
                     curr_msg = format_msg_text_only(it, init_msg, pdf_obs, warn_obs, ac_tree)
                 #messages.append(curr_msg)
                 messages = curr_msg
-                # print(messages)
-                print("ready to go!")
+       
 
             else:
                 curr_msg = {
@@ -389,7 +402,20 @@ def main():
             #    messages = clip_message_and_obs(messages, args.max_attached_imgs)
             #else:
             #    messages = clip_message_and_obs_text_only(messages, args.max_attached_imgs)
+            
+            import copy
+            debug_message = copy.deepcopy(messages)
 
+            if debug_message['role'] != 'user':
+                debug_messages.append(debug_message)
+            else:
+                for part in debug_message['parts']:
+                    if part.get('inline_data'):
+                        part['inline_data']['data'] = "attached_image"
+                    
+                debug_messages.append(debug_message)
+
+            #print(debug_message)
             # Call GPT-4v API
             prompt_tokens, completion_tokens, gpt_call_error, gemini_response = call_gemini_api(args, client, messages)
 
@@ -401,9 +427,10 @@ def main():
                 logging.info(f'Accumulate Prompt Tokens: {accumulate_prompt_token}; Accumulate Completion Tokens: {accumulate_completion_token}')
                 logging.info('API call complete...')
             gpt_4v_res = gemini_response
+
             messages = {'role': 'model', 'parts':[ {'text': gpt_4v_res}]}
-
-
+            debug_messages.append(messages)
+            print("***Agent****:" + gpt_4v_res)
             # remove the rects on the website
             if (not args.text_only) and rects:
                 logging.info(f"Num of interactive elements: {len(rects)}")
@@ -426,6 +453,7 @@ def main():
             # print(chosen_action)
             action_key, info = extract_information(chosen_action)
 
+            #print(action_key, info)
             fail_obs = ""
             pdf_obs = ""
             warn_obs = ""
@@ -518,6 +546,10 @@ def main():
                 time.sleep(2)
 
         # print_message(messages, task_dir)
+        if task_dir:
+            with open(os.path.join(task_dir, 'interact_messages.json'), 'w', encoding='utf-8') as fw:
+                json.dump(debug_messages, fw, indent=2)
+
         driver_task.quit()
         logging.info(f'Total cost: {accumulate_prompt_token / 1000 * 0.01 + accumulate_completion_token / 1000 * 0.03}')
 
